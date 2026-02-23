@@ -1,0 +1,30 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "anomaly-detection-stack"
+resolve_s3 = true
+s3_prefix = "anomaly-detection-stack"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+image_repositories = []
+disable_rollback = true
+parameter_overrides = "Environment=\"dev\" AnomalyScoreThresholdCPU=\"1.3055\" AnomalyScoreThresholdLog=\"0.8\" GracePeriodMinutes=\"1\" CpuRemediationMinPercent=\"75.0\" NotificationEmail=\"eamanze@cloudhight.com\" CPUAnomalyModelEndpoint=\"cpu-anomaly-detector-prod\" LogAnomalyModelEndpoint=\"nginx-anomaly-detector-prod\" JiraProjectKey=\"CA\" MonitoringFrequency=\"rate(5 minutes)\" InstanceTagKey=\"AnomalyMonitoring\" InstanceTagValue=\"enabled\""
+[default.build]
+[default.build.parameters]
+cached = true
+parallel = true
+[default.sync]
+[default.sync.parameters]
+watch = true
+[default.validate.parameters]
+lint = true
+[default.package.parameters]
+resolve_s3 = true
+
+[default.local_start_api.parameters]
+warm_containers = "EAGER"
+
+[default.local_start_lambda.parameters]
+warm_containers = "EAGER"
