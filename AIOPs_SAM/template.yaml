@@ -44,13 +44,6 @@ Parameters:
     MinValue: 1
     MaxValue: 60
     Description: Minutes to wait before auto-remediation
-
-  CpuRemediationMinPercent:
-    Type: Number
-    Default: 75.0
-    MinValue: 0.0
-    MaxValue: 100.0
-    Description: Minimum CPU percentage required to trigger auto-remediation
   
   NotificationEmail:
     Type: String
@@ -93,6 +86,22 @@ Parameters:
     Default: "enabled"
     Description: EC2 tag value to identify instances to monitor
 
+  EnableManagedGrafana:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Create AWS Managed Grafana workspace and bootstrap dashboard
+
+  GrafanaWorkspaceName:
+    Type: String
+    Default: anomaly-ops
+    Description: Base name for AWS Managed Grafana workspace
+
+Conditions:
+  CreateManagedGrafana: !Equals [!Ref EnableManagedGrafana, "true"]
+
 Resources:
   # Secrets Manager for Jira credentials
   JiraCredentialsSecret:
@@ -101,7 +110,7 @@ Resources:
       Name: !Sub jira-credentials-${Environment}
       Description: Jira API credentials for anomaly detection system
       GenerateSecretString:
-        SecretStringTemplate: '{"JIRA_API_URL":"https://cloudhight.atlassian.net","JIRA_USER_EMAIL":"leads@cloudhight.com","JIRA_API_TOKEN":""}'
+        SecretStringTemplate: '{"JIRA_API_URL":"https://cloudhight.atlassian.net","JIRA_USER_EMAIL":"PASTE_YOUR_JIRA_USER_EMAIL_HERE","JIRA_API_TOKEN":"PASTE_YOUR_JIRA_API_TOKEN_HERE"}'
         GenerateStringKey: "random"
         ExcludeCharacters: '"@/\'
 
@@ -222,7 +231,6 @@ Resources:
           ANOMALY_THRESHOLD_CPU: !Ref AnomalyScoreThresholdCPU
           ANOMALY_THRESHOLD_LOG: !Ref AnomalyScoreThresholdLog
           GRACE_PERIOD_MINUTES: !Ref GracePeriodMinutes
-          CPU_REMEDIATION_MIN_PERCENT: !Ref CpuRemediationMinPercent
           JIRA_PROJECT_KEY: !Ref JiraProjectKey
           JIRA_CREDENTIALS_SECRET: !Ref JiraCredentialsSecret
           INSTANCE_TAG_KEY: !Ref InstanceTagKey
@@ -499,6 +507,72 @@ Resources:
           ]
         }
 
+  GrafanaWorkspace:
+    Type: AWS::Grafana::Workspace
+    Condition: CreateManagedGrafana
+    Properties:
+      Name: !Sub ${GrafanaWorkspaceName}-${Environment}
+      Description: !Sub AIOps Grafana workspace for ${Environment}
+      AccountAccessType: CURRENT_ACCOUNT
+      RoleArn: !GetAtt GrafanaWorkspaceRole.Arn
+      AuthenticationProviders:
+        - AWS_SSO
+      PermissionType: SERVICE_MANAGED
+      DataSources:
+        - CLOUDWATCH
+      NotificationDestinations:
+        - SNS
+
+  GrafanaWorkspaceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateManagedGrafana
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: grafana.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
+
+  GrafanaBootstrapFunction:
+    Type: AWS::Serverless::Function
+    Condition: CreateManagedGrafana
+    Properties:
+      CodeUri: grafana_provisioner/
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Timeout: 180
+      MemorySize: 256
+      Tracing: PassThrough
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - grafana:DescribeWorkspace
+                - grafana:CreateWorkspaceApiKey
+                - grafana:DeleteWorkspaceApiKey
+              Resource: "*"
+
+  GrafanaBootstrapCustomResource:
+    Type: Custom::GrafanaBootstrap
+    Condition: CreateManagedGrafana
+    DependsOn:
+      - GrafanaWorkspace
+      - GrafanaBootstrapFunction
+    Properties:
+      ServiceToken: !GetAtt GrafanaBootstrapFunction.Arn
+      WorkspaceId: !GetAtt GrafanaWorkspace.Id
+      Region: !Ref AWS::Region
+      Environment: !Ref Environment
+      LambdaFunctionName: !Ref AnomalyDetectionLambda
+      MetricNamespace: AnomalyDetection
+      DashboardUid: !Sub anomaly-ops-${Environment}
+
 Outputs:
   AnomalyDetectionLambdaArn:
     Value: !GetAtt AnomalyDetectionLambda.Arn
@@ -553,3 +627,24 @@ Outputs:
     Description: CloudWatch Dashboard Name
     Export:
       Name: !Sub ${Environment}-AnomalyDashboard
+
+  GrafanaWorkspaceId:
+    Condition: CreateManagedGrafana
+    Value: !GetAtt GrafanaWorkspace.Id
+    Description: AWS Managed Grafana Workspace ID
+    Export:
+      Name: !Sub ${Environment}-GrafanaWorkspaceId
+
+  GrafanaWorkspaceUrl:
+    Condition: CreateManagedGrafana
+    Value: !Sub https://${GrafanaWorkspace.Endpoint}
+    Description: AWS Managed Grafana Workspace URL
+    Export:
+      Name: !Sub ${Environment}-GrafanaWorkspaceUrl
+
+  GrafanaDashboardUrl:
+    Condition: CreateManagedGrafana
+    Value: !Sub https://${GrafanaWorkspace.Endpoint}/d/anomaly-ops-${Environment}
+    Description: AIOps dashboard URL in AWS Managed Grafana
+    Export:
+      Name: !Sub ${Environment}-GrafanaDashboardUrl

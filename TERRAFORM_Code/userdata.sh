@@ -18,20 +18,16 @@ systemctl enable nginx
 systemctl start nginx
 
 # Configure Nginx to listen on localhost:8080 and proxy requests to Docker container
-cat > /etc/nginx/conf.d/app.conf <<'EOF'
-upstream docker_backend {
-    server 127.0.0.1:8080;
-}
-
+cat <<EOF > /etc/nginx/conf.d/app.conf
 server {
     listen 80;
     server_name _;
 
     location / {
-        proxy_pass http://docker_backend;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
 }
 EOF
@@ -45,6 +41,9 @@ docker login -u cloudhight -p Motiva123@
 # Pull and run container
 docker pull cloudhight/testapp:latest
 docker run -d -p 8080:8080 --name cloudhight-app --restart=unless-stopped cloudhight/testapp:latest
+
+# generate some traffic to create logs
+# for i in {1..1000}; do curl -s http://localhost/ > /dev/null; sleep 0.1; done
 
 # Install CloudWatch Agent
 yum install -y amazon-cloudwatch-agent
@@ -106,3 +105,10 @@ systemctl enable amazon-cloudwatch-agent
 sudo amazon-linux-extras install epel -y
 sudo yum update -y
 sudo yum install stress-ng -y
+
+# simulate CPU load at 70% for 600 seconds
+# stress-ng --cpu 4 --cpu-load 70 --timeout 600s
+
+# Test Nginx logs by generating traffic to the server
+# generate some traffic to create logs
+# for i in {1..300}; do curl -s http://localhost/ > /dev/null; sleep 0.1; done

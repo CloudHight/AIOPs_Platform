@@ -4,13 +4,13 @@ Main Lambda Handler
 """
 
 import os
-import math
 import json
 import time
 import uuid
 import boto3
 import requests
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
@@ -21,6 +21,7 @@ from aws_lambda_powertools.utilities.typing import LambdaContext
 from requests.auth import HTTPBasicAuth
 from requests.exceptions import RequestException, Timeout, ConnectionError
 from botocore.config import Config
+from boto3.dynamodb.conditions import Attr
 
 # Initialize AWS Lambda Powertools
 logger = powertools.Logger(service="anomaly-detection")
@@ -61,6 +62,10 @@ JIRA_ISSUE_TYPE = os.environ.get('JIRA_ISSUE_TYPE', 'Incident')
 INSTANCE_TAG_KEY = os.environ.get('INSTANCE_TAG_KEY', 'AnomalyMonitoring')
 INSTANCE_TAG_VALUE = os.environ.get('INSTANCE_TAG_VALUE', 'enabled')
 MONITORING_FREQUENCY = os.environ.get('MONITORING_FREQUENCY', 'rate(5 minutes)')
+LOG_MIN_ANOMALOUS_LINES = int(os.environ.get('LOG_MIN_ANOMALOUS_LINES', '2'))
+LOG_JIRA_MIN_ANOMALOUS_LINES = int(os.environ.get('LOG_JIRA_MIN_ANOMALOUS_LINES', '3'))
+LOG_JIRA_SUPPRESSION_MINUTES = int(os.environ.get('LOG_JIRA_SUPPRESSION_MINUTES', '5'))
+LOG_REPEAT_LOOKBACK_MINUTES = int(os.environ.get('LOG_REPEAT_LOOKBACK_MINUTES', '15'))
 
 # Global configuration (fetched from SSM Parameter Store)
 _config_cache = {}
@@ -75,7 +80,6 @@ class AnomalyConfig:
     grace_period_minutes: int = 15
     auto_remediation_enabled: bool = True
     dry_run: bool = False
-    cpu_remediation_min_percent: float = 5.0
     
     @classmethod
     def from_environment(cls):
@@ -85,8 +89,7 @@ class AnomalyConfig:
             log_threshold=float(os.environ.get('ANOMALY_THRESHOLD_LOG', 0.80)),
             grace_period_minutes=int(os.environ.get('GRACE_PERIOD_MINUTES', 15)),
             auto_remediation_enabled=True,
-            dry_run=False,
-            cpu_remediation_min_percent=float(os.environ.get('CPU_REMEDIATION_MIN_PERCENT', 5.0))
+            dry_run=False
         )
 
 class AnomalyDetectionError(Exception):
@@ -104,6 +107,23 @@ class SageMakerError(AnomalyDetectionError):
 class DynamoDBError(AnomalyDetectionError):
     """Exception for DynamoDB operations"""
     pass
+
+
+def _normalize_signature_text(text: str) -> str:
+    text = (text or "").lower()
+    text = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", "<ip>", text)
+    text = re.sub(r"\b[a-f0-9]{8,32}\b", "<id>", text)
+    text = re.sub(r"\b\d+\b", "<num>", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except Exception:
+        return None
 
 @tracer.capture_method
 def get_config() -> AnomalyConfig:
@@ -132,8 +152,6 @@ def get_config() -> AnomalyConfig:
                 config_dict['grace_period_minutes'] = int(param_value)
             elif param_name == 'DryRun':
                 config_dict['dry_run'] = param_value.lower() == 'true'
-            elif param_name == 'CpuRemediationMinPercent':
-                config_dict['cpu_remediation_min_percent'] = float(param_value)
         
         base_config = AnomalyConfig.from_environment()
         for key, value in config_dict.items():
@@ -212,7 +230,7 @@ def fetch_cpu_metrics(instance_id: str) -> List[float]:
     """Fetch CPU utilization metrics from CloudWatch"""
     try:
         end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(minutes=10)  # Last 10 minutes
+        start_time = end_time - timedelta(minutes=15)  # Last 15 minutes
         
         response = cloudwatch.get_metric_data(
             MetricDataQueries=[
@@ -304,7 +322,7 @@ def fetch_nginx_logs(instance_id: str) -> List[Dict[str, Any]]:
         
         all_logs = []
         end_time = int(datetime.now(timezone.utc).timestamp() * 1000)
-        start_time = end_time - (15 * 60 * 1000)  # Last 10 minutes
+        start_time = end_time - (15 * 60 * 1000)  # Last 15 minutes
         
         for log_group in log_groups:
             try:
@@ -471,89 +489,128 @@ def invoke_sagemaker_model(endpoint_name: str, data: Dict[str, Any]) -> float:
     
     return 0.0
 
-def _extract_log_score(result: Any) -> float:
-    """Extract anomaly score from common text model response shapes."""
+def _extract_log_predictions(result: Any, log_lines: List[str]) -> List[Dict[str, Any]]:
+    """Extract per-line anomaly predictions from common text model response shapes."""
+    predictions: List[Dict[str, Any]] = []
     try:
-        def _is_anomaly_label(label: str) -> bool:
-            label_l = label.lower()
-            if 'anomaly' in label_l or 'abnormal' in label_l or 'anomalous' in label_l:
-                return True
-            # HuggingFace sequence classifier default labels
-            return label_l in {"label_1", "1"}
-
-        # Case 1: [{"label": "...", "score": 0.9}, ...]
         if isinstance(result, list) and result:
-            first = result[0]
-            if isinstance(first, dict):
-                # list of dicts with label/score
-                anomaly_scores = []
-                label_0_scores = []
-                label_1_scores = []
-                for item in result:
-                    if isinstance(item, dict) and 'score' in item:
-                        label = str(item.get('label', '')).lower()
-                        score = float(item['score'])
-                        if _is_anomaly_label(label):
-                            anomaly_scores.append(score)
-                        if label == 'label_0':
-                            label_0_scores.append(score)
-                        elif label == 'label_1':
-                            label_1_scores.append(score)
-                if anomaly_scores:
-                    return max(anomaly_scores)
-                # If labels are LABEL_0/LABEL_1, convert to anomaly confidence
-                if label_1_scores or label_0_scores:
-                    # anomaly confidence = score for LABEL_1, or (1 - score) for LABEL_0
-                    converted = label_1_scores + [1.0 - s for s in label_0_scores]
-                    if converted:
-                        return max(converted)
-                # fallback: take max score from list
-                scores = [float(item['score']) for item in result if isinstance(item, dict) and 'score' in item]
-                if scores:
-                    return max(scores)
-            # list of lists (batched): pick first element recursively
-            if isinstance(first, list):
-                return _extract_log_score(first)
+            if all(isinstance(item, dict) for item in result):
+                for idx, item in enumerate(result):
+                    score = float(item.get('score', 0.0))
+                    threshold = float(item.get('threshold', 0.5))
+                    predictions.append({
+                        'line': log_lines[idx] if idx < len(log_lines) else '',
+                        'label': str(item.get('label', 'LABEL_0')).upper(),
+                        'score': score,
+                        'threshold': threshold,
+                    })
+                return predictions
+            if isinstance(result[0], list):
+                return _extract_log_predictions(result[0], log_lines)
 
-        # Case 2: {"labels": [...], "scores": [...]}
         if isinstance(result, dict):
             labels = result.get('labels')
             scores = result.get('scores')
-            if isinstance(labels, list) and isinstance(scores, list) and len(labels) == len(scores):
-                anomaly_scores = [
-                    float(scores[i]) for i, label in enumerate(labels)
-                    if isinstance(label, str) and _is_anomaly_label(label)
-                ]
-                if anomaly_scores:
-                    return max(anomaly_scores)
-                label_0_scores = [
-                    float(scores[i]) for i, label in enumerate(labels)
-                    if isinstance(label, str) and label.lower() == 'label_0'
-                ]
-                label_1_scores = [
-                    float(scores[i]) for i, label in enumerate(labels)
-                    if isinstance(label, str) and label.lower() == 'label_1'
-                ]
-                if label_1_scores or label_0_scores:
-                    converted = label_1_scores + [1.0 - s for s in label_0_scores]
-                    if converted:
-                        return max(converted)
-                return float(max(scores)) if scores else 0.0
-            # direct score
+            threshold = float(result.get('threshold', 0.5))
+            if isinstance(labels, list) and isinstance(scores, list):
+                for idx, label in enumerate(labels[:len(scores)]):
+                    predictions.append({
+                        'line': log_lines[idx] if idx < len(log_lines) else '',
+                        'label': str(label).upper(),
+                        'score': float(scores[idx]),
+                        'threshold': threshold,
+                    })
+                return predictions
             if 'score' in result:
-                return float(result['score'])
+                predictions.append({
+                    'line': log_lines[0] if log_lines else '',
+                    'label': str(result.get('label', 'LABEL_0')).upper(),
+                    'score': float(result.get('score', 0.0)),
+                    'threshold': float(result.get('threshold', 0.5)),
+                })
+                return predictions
     except Exception:
-        return 0.0
-    return 0.0
+        return []
+    return []
+
+
+def _summarize_log_predictions(predictions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Summarize per-line anomaly predictions using count-based gating."""
+    anomalous_lines = [
+        item for item in predictions
+        if item.get('label') == 'LABEL_1' and float(item.get('score', 0.0)) >= float(item.get('threshold', 0.5))
+    ]
+    top_anomalous_lines = sorted(
+        anomalous_lines,
+        key=lambda item: float(item.get('score', 0.0)),
+        reverse=True
+    )[:5]
+    anomaly_scores = [float(item.get('score', 0.0)) for item in anomalous_lines]
+    avg_anomaly_score = sum(anomaly_scores) / len(anomaly_scores) if anomaly_scores else 0.0
+    max_anomaly_score = max(anomaly_scores) if anomaly_scores else 0.0
+    threshold = float(predictions[0].get('threshold', 0.5)) if predictions else 0.5
+
+    return {
+        'predictions': predictions,
+        'threshold': threshold,
+        'anomalous_lines': anomalous_lines,
+        'anomalous_line_count': len(anomalous_lines),
+        'avg_anomaly_score': avg_anomaly_score,
+        'max_anomaly_score': max_anomaly_score,
+        'top_anomalous_lines': top_anomalous_lines,
+        'decision_method': f'count>={LOG_MIN_ANOMALOUS_LINES}',
+        'should_trigger_detection': len(anomalous_lines) >= LOG_MIN_ANOMALOUS_LINES,
+    }
+
+
+def _build_log_detection_signature(top_anomalous_lines: List[Dict[str, Any]]) -> str:
+    snippets = []
+    for item in top_anomalous_lines[:3]:
+        line = item.get('line', '')
+        normalized = _normalize_signature_text(line[:160])
+        if normalized:
+            snippets.append(normalized)
+    return " | ".join(sorted(set(snippets)))
+
+
+@tracer.capture_method
+def get_recent_log_anomaly_history(instance_id: str, detection_signature: str, lookback_minutes: int = 60) -> List[Dict[str, Any]]:
+    """Fetch recent log anomaly records for deduplication and repeated-detection checks."""
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+        table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+        response = table.scan(
+            FilterExpression=(
+                Attr('instance_id').eq(instance_id) &
+                Attr('model_type').eq('log_anomaly') &
+                Attr('environment').eq(ENVIRONMENT)
+            )
+        )
+        items = response.get('Items', [])
+        matches: List[Dict[str, Any]] = []
+        for item in items:
+            created_at = item.get('created_at') or item.get('timestamp')
+            created_dt = _parse_iso_datetime(created_at)
+            if not created_dt:
+                continue
+            if created_dt < cutoff:
+                continue
+            metadata = item.get('metadata', {}) or {}
+            if metadata.get('detection_signature') == detection_signature:
+                matches.append(item)
+        return matches
+    except Exception as e:
+        logger.warning(f"Failed to fetch recent log anomaly history for {instance_id}: {str(e)}")
+        return []
 
 @tracer.capture_method(capture_response=False, capture_error=False)
-def invoke_sagemaker_log_model(endpoint_name: str, log_lines: List[str]) -> float:
+def invoke_sagemaker_log_model(endpoint_name: str, log_lines: List[str]) -> Dict[str, Any]:
     """Invoke SageMaker text model endpoint for log anomaly detection."""
     for attempt in range(MAX_RETRIES):
         try:
             if not log_lines:
                 logger.warning(f"No log lines provided for {endpoint_name}")
-                return 0.0
+                return _summarize_log_predictions([])
 
             payload = {"inputs": log_lines}
             logger.debug(f"Invoking {endpoint_name} with JSON input, {len(log_lines)} lines")
@@ -566,10 +623,20 @@ def invoke_sagemaker_log_model(endpoint_name: str, log_lines: List[str]) -> floa
             )
 
             result = json.loads(response['Body'].read().decode('utf-8'))
-            score = _extract_log_score(result)
-            logger.info(f"SageMaker log inference score: {score:.4f} from {len(log_lines)} lines")
+            predictions = _extract_log_predictions(result, log_lines)
+            analysis = _summarize_log_predictions(predictions)
+            logger.info(
+                "SageMaker log inference diagnostics: threshold=%s, anomalous_lines=%s/%s, "
+                "avg_anomaly_score=%.4f, max_anomaly_score=%.4f, decision_method=%s",
+                analysis['threshold'],
+                analysis['anomalous_line_count'],
+                len(log_lines),
+                analysis['avg_anomaly_score'],
+                analysis['max_anomaly_score'],
+                analysis['decision_method'],
+            )
             metrics.add_metric(name="SageMakerInvocations", unit="Count", value=1)
-            return score
+            return analysis
 
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
@@ -579,6 +646,7 @@ def invoke_sagemaker_log_model(endpoint_name: str, log_lines: List[str]) -> floa
             else:
                 logger.error(f"All retries failed for SageMaker endpoint {endpoint_name}: {str(e)[:500]}")
                 raise SageMakerError(f"Failed to invoke model {endpoint_name} after {MAX_RETRIES} attempts: {str(e)[:500]}")
+    return _summarize_log_predictions([])
 
 @tracer.capture_method
 def store_inference_result(anomaly_data: Dict[str, Any]) -> str:
@@ -1045,32 +1113,20 @@ def process_cpu_anomaly(instance_id: str, metrics_data: List[float], score: floa
         # Initialize table variable at the beginning
         table = dynamodb.Table(DYNAMODB_TABLE_NAME)
         
-        avg_cpu = 0.0
-        max_cpu = 0.0
-        p95_cpu = 0.0
+        # Safety check: if CPU is low, don't flag as anomaly even if score is high
         if metrics_data:
             avg_cpu = sum(metrics_data) / len(metrics_data)
             max_cpu = max(metrics_data) if metrics_data else 0.0
-            sorted_values = sorted(metrics_data)
-            if sorted_values:
-                p95_index = max(0, int(math.ceil(0.95 * len(sorted_values)) - 1))
-                p95_cpu = sorted_values[p95_index]
             
-            logger.info(
-                f"CPU Analysis - Instance: {instance_id}, Avg: {avg_cpu:.2f}%, "
-                f"P95: {p95_cpu:.2f}%, Max: {max_cpu:.2f}%, "
-                f"Score: {score:.4f}, Threshold: {config.cpu_threshold}"
-            )
+            logger.info(f"CPU Analysis - Instance: {instance_id}, Avg: {avg_cpu:.2f}%, Max: {max_cpu:.2f}%, Score: {score:.4f}, Threshold: {config.cpu_threshold}")
+            
+            # If actual CPU is below 5%, don't flag as anomaly regardless of score
+            if max_cpu < 5.0:
+                logger.debug(f"Ignoring anomaly: CPU {max_cpu:.2f}% is below operational threshold")
+                return
         
         if score < config.cpu_threshold:
             logger.debug(f"CPU anomaly score {score} below threshold {config.cpu_threshold} for {instance_id}")
-            return
-
-        if p95_cpu < config.cpu_remediation_min_percent:
-            logger.info(
-                f"Skipping CPU anomaly actions for {instance_id}: "
-                f"P95 CPU {p95_cpu:.2f}% below minimum {config.cpu_remediation_min_percent:.2f}%"
-            )
             return
         
         anomaly_data = {
@@ -1086,10 +1142,7 @@ def process_cpu_anomaly(instance_id: str, metrics_data: List[float], score: floa
                 'metric_name': 'CPUUtilization',
                 'metric_namespace': 'AWS/EC2',
                 'monitoring_frequency': MONITORING_FREQUENCY
-            },
-            'avg_cpu_percent': avg_cpu,
-            'p95_cpu_percent': p95_cpu,
-            'max_cpu_percent': max_cpu
+            }
         }
         
         # Store inference result
@@ -1141,38 +1194,101 @@ def process_cpu_anomaly(instance_id: str, metrics_data: List[float], score: floa
         metrics.add_metric(name="CPUProcessingErrors", unit="Count", value=1)
 
 @tracer.capture_method
-def process_log_anomaly(instance_id: str, logs_data: List[Dict[str, Any]], score: float) -> None:
+def process_log_anomaly(instance_id: str, logs_data: List[Dict[str, Any]], analysis: Dict[str, Any]) -> None:
     """Process log anomaly detection result"""
     try:
         config = get_config()
         
         # Initialize table variable at the beginning
         table = dynamodb.Table(DYNAMODB_TABLE_NAME)
-        
-        if score < config.log_threshold:
-            logger.debug(f"Log anomaly score {score} below threshold {config.log_threshold} for {instance_id}")
+
+        anomalous_lines = analysis.get('anomalous_lines', [])
+        anomalous_line_count = int(analysis.get('anomalous_line_count', 0))
+        threshold = float(analysis.get('threshold', config.log_threshold))
+        avg_anomaly_score = float(analysis.get('avg_anomaly_score', 0.0))
+        max_anomaly_score = float(analysis.get('max_anomaly_score', 0.0))
+        top_anomalous_lines = analysis.get('top_anomalous_lines', [])
+        decision_method = analysis.get('decision_method', 'count')
+
+        logger.info(
+            "Log anomaly decision - Instance: %s, threshold=%.4f, anomalous_lines=%s, "
+            "avg_anomaly_score=%.4f, max_anomaly_score=%.4f, decision_method=%s",
+            instance_id,
+            threshold,
+            anomalous_line_count,
+            avg_anomaly_score,
+            max_anomaly_score,
+            decision_method,
+        )
+
+        if anomalous_line_count < LOG_MIN_ANOMALOUS_LINES:
+            logger.debug(
+                "Skipping log anomaly for %s: anomalous_lines=%s below minimum=%s",
+                instance_id,
+                anomalous_line_count,
+                LOG_MIN_ANOMALOUS_LINES,
+            )
             return
-        
-        # Extract error patterns from logs
+
         error_patterns = []
         for log in logs_data[:10]:  # Check first 10 logs for patterns
             message = log.get('message', '')
             if 'error' in message.lower():
                 error_patterns.append(message[:100])  # First 100 chars
+
+        detection_signature = _build_log_detection_signature(top_anomalous_lines)
+        recent_matches = get_recent_log_anomaly_history(
+            instance_id,
+            detection_signature,
+            lookback_minutes=max(LOG_JIRA_SUPPRESSION_MINUTES, LOG_REPEAT_LOOKBACK_MINUTES)
+        )
+        repeated_detection = len(recent_matches) >= 1
+        recent_open_jira = next(
+            (
+                item for item in recent_matches
+                if item.get('jira_ticket_id') and
+                item.get('status') in {'jira_ticket_created', 'remediation_scheduled', 'remediation_executed'} and
+                (
+                    _parse_iso_datetime(item.get('created_at') or item.get('timestamp')) or
+                    datetime.now(timezone.utc)
+                ) >= datetime.now(timezone.utc) - timedelta(minutes=LOG_JIRA_SUPPRESSION_MINUTES)
+            ),
+            None
+        )
+        should_create_jira = anomalous_line_count >= LOG_JIRA_MIN_ANOMALOUS_LINES or repeated_detection
         
         anomaly_data = {
             'anomaly_id': f"log-{instance_id}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}",
             'model_type': 'log_anomaly',
             'instance_id': instance_id,
-            'inference_score': score,
-            'threshold': config.log_threshold,
+            'inference_score': avg_anomaly_score,
+            'threshold': threshold,
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'log_count': len(logs_data),
-            'data_summary': f"Nginx logs analyzed: {len(logs_data)} log entries. Error patterns: {', '.join(set(error_patterns))[:200]}...",
+            'data_summary': (
+                f"Nginx logs analyzed: {len(logs_data)} log entries. "
+                f"Anomalous lines: {anomalous_line_count}. "
+                f"Top patterns: {', '.join(set(error_patterns))[:200]}..."
+            ),
             'metadata': {
                 'log_type': 'nginx_access_error',
                 'error_patterns': error_patterns[:5],
-                'monitoring_frequency': MONITORING_FREQUENCY
+                'monitoring_frequency': MONITORING_FREQUENCY,
+                'detection_signature': detection_signature,
+                'anomalous_line_count': anomalous_line_count,
+                'avg_anomaly_score': avg_anomaly_score,
+                'max_anomaly_score': max_anomaly_score,
+                'decision_method': decision_method,
+                'top_anomalous_lines': [
+                    {
+                        'score': float(item.get('score', 0.0)),
+                        'threshold': float(item.get('threshold', threshold)),
+                        'line': item.get('line', '')[:200],
+                    }
+                    for item in top_anomalous_lines
+                ],
+                'repeated_detection': repeated_detection,
+                'should_create_jira': should_create_jira,
             }
         }
         
@@ -1183,7 +1299,41 @@ def process_log_anomaly(instance_id: str, logs_data: List[Dict[str, Any]], score
         # Emit EventBridge event
         emit_eventbridge_event(anomaly_data, 'Log Anomaly Detected')
         metrics.add_metric(name="LogAnomaliesDetected", unit="Count", value=1)
-        
+        metrics.add_metric(name="LogAnomalousLines", unit="Count", value=anomalous_line_count)
+
+        if not should_create_jira:
+            table.update_item(
+                Key={'anomaly_id': anomaly_id},
+                UpdateExpression='SET #s = :status',
+                ExpressionAttributeNames={'#s': 'status'},
+                ExpressionAttributeValues={':status': 'detected_no_ticket'}
+            )
+            logger.info(
+                "Log anomaly detected for %s without Jira. anomalous_lines=%s, repeated_detection=%s",
+                instance_id,
+                anomalous_line_count,
+                repeated_detection,
+            )
+            return
+
+        if recent_open_jira:
+            table.update_item(
+                Key={'anomaly_id': anomaly_id},
+                UpdateExpression='SET #s = :status, suppressed_by = :suppressed_by',
+                ExpressionAttributeNames={'#s': 'status'},
+                ExpressionAttributeValues={
+                    ':status': 'jira_suppressed',
+                    ':suppressed_by': recent_open_jira.get('jira_ticket_id', '')
+                }
+            )
+            logger.info(
+                "Suppressing Jira creation for %s due to recent open ticket %s within %s minutes",
+                instance_id,
+                recent_open_jira.get('jira_ticket_id', ''),
+                LOG_JIRA_SUPPRESSION_MINUTES,
+            )
+            return
+
         try:
             # Create Jira ticket
             jira_ticket_id = create_jira_ticket(anomaly_data)
@@ -1298,11 +1448,11 @@ def process_instance(instance_id: str) -> None:
             nginx_logs = fetch_nginx_logs(instance_id)
             if nginx_logs:
                 log_lines = [log.get('message', '') for log in nginx_logs[:50] if log.get('message')]
-                log_score = invoke_sagemaker_log_model(
+                log_analysis = invoke_sagemaker_log_model(
                     LOG_MODEL_ENDPOINT,
                     log_lines
                 )
-                process_log_anomaly(instance_id, nginx_logs, log_score)
+                process_log_anomaly(instance_id, nginx_logs, log_analysis)
             else:
                 logger.debug(f"No Nginx logs available for {instance_id}")
         except Exception as e:

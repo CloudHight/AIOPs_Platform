@@ -1,121 +1,174 @@
-# BERT ML Workflow for Nginx Log Anomaly Detection
+# BERT_UPDATE
 
-This repository contains a complete ML workflow split into 6 stages, designed to run individually on SageMaker Jupyter notebooks.
+This folder contains the updated BERT-based log anomaly detection pipeline for SageMaker.
 
-## Workflow Stages
+## What Changed
 
-### 1. Data Creation (`01_create_data.py`)
-- Generates synthetic nginx access and error logs
-- Labels anomalies (5XX errors, critical errors)
-- Splits data into train/validation/test sets
-- Uploads data to S3
+- Better synthetic data with hard negatives and more realistic anomaly patterns
+- Log normalization to reduce overfitting to timestamps, IPs, IDs, and numeric noise
+- Context-window samples instead of only single-line classification
+- Class-weighted training for imbalanced anomaly labels
+- Threshold tuning during training, saved in `threshold_config.json`
+- SageMaker-first workflow:
+  - training artifacts stay in S3
+  - validation reads SageMaker metadata first
+  - deployment resolves the best model artifact directly from SageMaker
 
-**Usage:**
+## Files
+
+- `01_create_data.py`: generate train/validation/test datasets and optionally upload them to S3
+- `train.py`: Hugging Face training entry point used by SageMaker
+- `02_train_model.py`: launch SageMaker hyperparameter tuning and optionally monitor it until completion
+- `03_validate_model.py`: report final results from a training job or tuning job using SageMaker metadata
+- `04_test_model.py`: test a local saved model or deployed endpoint
+- `05_deploy_model.py`: deploy from a model artifact S3 URI, training job, or tuning job
+- `06_monitor_model.py`: run simple endpoint health and inference monitoring
+- `monitor_training.py`: watch a SageMaker training job or tuning job until it finishes
+- `inference.py`: custom SageMaker inference entry point that loads `threshold_config.json`
+
+## Recommended Workflow
+
+### 1. Create the dataset
+
+Run from SageMaker Notebook:
+
 ```python
-# Update these variables in the script:
-BUCKET = "your-s3-bucket-name"
-PROCESSED_PREFIX = "your-folder-name/"
-
-# Run the script
-%run 01_create_data.py
+!python BERT_UPDATE/01_create_data.py \
+  --output-dir BERT_UPDATE/data \
+  --bucket <your-bucket> \
+  --s3-prefix bert-update/data
 ```
 
-### 2. Model Training (`02_train_model.py`)
-- Launches SageMaker hyperparameter tuning job
-- Uses BERT-base-uncased for sequence classification
-- Optimizes learning rate and batch size
+This creates:
 
-**Usage:**
+- `train/train.json`
+- `validation/validation.json`
+- `test/test.json`
+- `dataset_summary.json`
+
+and uploads them to:
+
+- `s3://<your-bucket>/bert-update/data/train/`
+- `s3://<your-bucket>/bert-update/data/validation/`
+- `s3://<your-bucket>/bert-update/data/test/`
+
+### 2. Launch and monitor training
+
 ```python
-# Update these variables:
-BUCKET = "your-s3-bucket-name"
-PROCESSED_PREFIX = "your-folder-name/"
-
-# Run the script
-%run 02_train_model.py
+!python BERT_UPDATE/02_train_model.py \
+  --bucket <your-bucket> \
+  --prefix bert-update/data \
+  --train-script BERT_UPDATE/train.py \
+  --wait
 ```
 
-### 3. Model Validation (`03_validate_model.py`)
-- Monitors hyperparameter tuning progress
-- Identifies best performing model
-- Retrieves model artifacts location
+What this does:
 
-**Usage:**
+- launches a SageMaker hyperparameter tuning job
+- prints the tuning job name
+- if `--wait` is set, monitors the tuning job until it reaches `Completed`, `Failed`, or `Stopped`
+
+Optional:
+
 ```python
-# Update with your tuning job name from step 2:
-TUNING_JOB_NAME = "your-tuning-job-name"
-
-# Run the script
-%run 03_validate_model.py
+!python BERT_UPDATE/02_train_model.py \
+  --bucket <your-bucket> \
+  --prefix bert-update/data \
+  --train-script BERT_UPDATE/train.py \
+  --wait \
+  --poll-seconds 30
 ```
 
-### 4. Model Testing (`04_test_model.py`)
-- Creates temporary endpoint with best model
-- Evaluates model on test set
-- Calculates final accuracy metrics
-- Cleans up test endpoint
+### 3. Validate the final result
 
-**Usage:**
+For a tuning job:
+
 ```python
-# Update these variables:
-BUCKET = "your-s3-bucket-name"
-PROCESSED_PREFIX = "your-folder-name/"
-MODEL_ARTIFACTS_URI = "s3://path/to/best/model/artifacts"
-
-# Run the script
-%run 04_test_model.py
+!python BERT_UPDATE/03_validate_model.py --tuning-job-name <your-tuning-job-name>
 ```
 
-### 5. Model Deployment (`05_deploy_model.py`)
-- Deploys model to production endpoint
-- Tests endpoint with sample data
-- Sets up persistent inference endpoint
+For a single training job:
 
-**Usage:**
 ```python
-# Update these variables:
-MODEL_ARTIFACTS_URI = "s3://path/to/best/model/artifacts"
-ENDPOINT_NAME = "nginx-anomaly-detector-prod"
-
-# Run the script
-%run 05_deploy_model.py
+!python BERT_UPDATE/03_validate_model.py --training-job-name <your-training-job-name>
 ```
 
-### 6. Model Monitoring (`06_monitor_model.py`)
-- Monitors endpoint health and metrics
-- Runs batch inference on new data
-- Saves monitoring results to S3
+This script reports primarily from SageMaker metadata:
 
-**Usage:**
+- best training job
+- training/tuning status
+- model artifact S3 URI
+- final metrics reported by SageMaker
+- tuned threshold if it was captured as a metric
+
+### 4. Deploy the best model
+
+Deploy directly from a tuning job:
+
 ```python
-# Update these variables:
-ENDPOINT_NAME = "nginx-anomaly-detector-prod"
-BUCKET = "your-s3-bucket-name"
-MONITORING_PREFIX = "your-folder-name/monitoring/"
-
-# Run the script
-%run 06_monitor_model.py
+!python BERT_UPDATE/05_deploy_model.py \
+  --tuning-job-name <your-tuning-job-name> \
+  --endpoint-name nginx-anomaly-detector-update
 ```
 
-## Prerequisites
+Or deploy from a training job:
 
-1. **SageMaker Execution Role**: Ensure your notebook has proper IAM permissions
-2. **S3 Bucket**: Create an S3 bucket for storing data and results
-3. **Dependencies**: The `train.py` file must be present for training
+```python
+!python BERT_UPDATE/05_deploy_model.py \
+  --training-job-name <your-training-job-name> \
+  --endpoint-name nginx-anomaly-detector-update
+```
 
-## Configuration
+Or deploy from a direct S3 artifact URI:
 
-Before running any script, update these common variables:
-- `YOUR_BUCKET_NAME`: Your S3 bucket name
-- `YOUR_FOLDER_NAME`: Prefix for organizing files in S3
-- `YOUR_ROLE_NAME`: SageMaker execution role (if not using default)
+```python
+!python BERT_UPDATE/05_deploy_model.py \
+  --model-artifacts-uri s3://<your-bucket>/<path>/model.tar.gz \
+  --endpoint-name nginx-anomaly-detector-update
+```
 
-## Execution Order
+The deployed endpoint uses `inference.py`, which loads `threshold_config.json` from the model artifact automatically.
 
-Run the scripts in numerical order (01 → 02 → 03 → 04 → 05 → 06), waiting for each stage to complete before proceeding to the next.
+### 5. Watch training separately if needed
 
-## Cost Considerations
+```python
+!python BERT_UPDATE/monitor_training.py --tuning-job-name <your-tuning-job-name>
+```
 
-- Training uses `ml.g4dn.xlarge` instances
-- Deployment uses `ml.m5.xlarge` instances
-- Remember to delete endpoints when not in use to avoid charges
+or:
+
+```python
+!python BERT_UPDATE/monitor_training.py --training-job-name <your-training-job-name>
+```
+
+### 6. Test and monitor the endpoint
+
+Quick endpoint test:
+
+```python
+!python BERT_UPDATE/04_test_model.py --endpoint-name nginx-anomaly-detector-update
+```
+
+Simple monitoring script:
+
+```python
+!python BERT_UPDATE/06_monitor_model.py
+```
+
+## Important Outputs
+
+- `threshold_config.json`: tuned anomaly threshold stored in the model artifact
+- `training_summary.json`: detailed training summary stored in the model artifact
+- SageMaker model artifact:
+  - `s3://.../model.tar.gz`
+
+## Notes
+
+- `03_validate_model.py` is metadata-first. It does not need to download the model artifact for the normal SageMaker workflow.
+- `05_deploy_model.py` deploys directly from the best SageMaker artifact in S3.
+- If your SageMaker account has limited quota, keep `max_parallel_jobs=1` in `02_train_model.py`.
+- The current runtime configuration uses:
+  - `transformers_version="4.26"`
+  - `pytorch_version="1.13"`
+  - `py_version="py39"`
+  because those are broadly compatible with common SageMaker notebook SDK setups.
